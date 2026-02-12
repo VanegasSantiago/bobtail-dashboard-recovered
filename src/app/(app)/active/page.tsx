@@ -17,7 +17,7 @@ interface ActiveCall {
   triggeredAt: string | null;
 }
 
-const MAX_SLOTS = 25;
+const MAX_SLOTS = parseInt(process.env.NEXT_PUBLIC_MAX_CONCURRENT_CALLS ?? "25", 10);
 const HAPPYROBOT_ORG = process.env.NEXT_PUBLIC_HAPPYROBOT_ORG_SLUG;
 const HAPPYROBOT_WORKFLOW = process.env.NEXT_PUBLIC_HAPPYROBOT_WORKFLOW_ID;
 

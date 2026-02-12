@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
 import { cn } from "@/lib/utils";
 
-const MAX_CONCURRENT = 25;
+const MAX_CONCURRENT = parseInt(process.env.NEXT_PUBLIC_MAX_CONCURRENT_CALLS ?? "25", 10);
 
 export function ActiveCallsBar() {
   const queryClient = useQueryClient();
