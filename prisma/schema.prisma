@@ -1,0 +1,286 @@
+// =============================================================================
+// Bobtail Collections - Database Schema
+// =============================================================================
+//
+// This schema defines the data model for the payment collection campaign system.
+//
+// Key concepts:
+// - Campaign: A collection campaign created from a CSV upload
+// - Debtor: A person/company that owes money (grouped from CSV rows by name)
+// - Invoice: Individual loads/invoices owed by a debtor
+// - Call: An AI call attempt to collect payment from a debtor
+//
+// Relationships:
+// - Campaign has many Debtors
+// - Debtor has many Invoices (one debtor can owe multiple loads)
+// - Debtor has many Calls (retry attempts)
+// - Call belongs to Campaign (denormalized for efficient queries)
+//
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTH MODELS (NextAuth.js)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  name          String?
+  image         String?   // Profile picture from OAuth providers
+  role          String    @default("VIEWER") // ADMIN, OPERATOR, VIEWER
+
+  // NextAuth.js fields
+  emailVerified DateTime? @map("email_verified")
+
+  // Timestamps
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  accounts      Account[]
+  sessions      Session[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(uuid())
+  userId            String  @map("user_id")
+  type              String
+  provider          String
+  providerAccountId String  @map("provider_account_id")
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  sessionToken String   @unique @map("session_token")
+  userId       String   @map("user_id")
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+model Invite {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  role      String   @default("VIEWER") // Role to assign when user accepts
+  invitedBy String?  @map("invited_by")
+  token     String   @unique @default(uuid())
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("invites")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAMPAIGN MODEL - Each upload creates a new campaign
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Campaign {
+  id              String    @id @default(uuid())
+
+  // Sequential campaign number for easy reference (1, 2, 3...)
+  campaignNumber  Int       @unique @default(autoincrement()) @map("campaign_number")
+
+  // Campaign info
+  name            String    // User-friendly name or auto-generated from filename
+  sourceFile      String    @map("source_file")
+
+  // Status: ACTIVE, PAUSED, COMPLETED, ARCHIVED
+  status          String    @default("ACTIVE")
+
+  // Only one campaign can be active at a time
+  isActive        Boolean   @default(false) @map("is_active")
+
+  // Totals (denormalized for quick access)
+  totalDebtors    Int       @default(0) @map("total_debtors")
+  totalInvoices   Int       @default(0) @map("total_invoices")
+  totalAmount     Float     @default(0) @map("total_amount")
+  emailOnlyDebtors Int      @default(0) @map("email_only_debtors")
+  callableDebtors Int       @default(0) @map("callable_debtors")
+
+  // Settings
+  maxConcurrent   Int       @default(25) @map("max_concurrent")
+  maxAttempts     Int       @default(3) @map("max_attempts")
+
+  // Queue state
+  isQueuePaused   Boolean   @default(false) @map("is_queue_paused")
+
+  // Timestamps
+  importedAt      DateTime  @default(now()) @map("imported_at")
+  startedAt       DateTime? @map("started_at")
+  completedAt     DateTime? @map("completed_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relationships
+  debtors         Debtor[]
+  calls           Call[]
+
+  @@index([status])
+  @@index([isActive])
+  @@index([createdAt])
+  @@map("campaigns")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEBTOR MODEL - Grouped from CSV (one row per unique debtor)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Debtor {
+  id              String    @id @default(uuid())
+
+  // Campaign relationship
+  campaignId      String    @map("campaign_id")
+  campaign        Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  // Sequential debtor number within campaign (1, 2, 3, ... N)
+  debtorNumber    Int       @map("debtor_number")
+
+  // Debtor Info
+  debtorName      String    @map("debtor_name")
+  debtorMc        String?   @map("debtor_mc")
+  debtorDot       String?   @map("debtor_dot")
+  phoneNumber     String    @map("phone_number")
+  debtorEmail     String?   @map("debtor_email")
+  timezone        String?
+
+  // Aggregated totals
+  totalAmount     Float     @map("total_amount")
+  numInvoices     Int       @map("num_invoices")
+
+  // Whether this debtor is email-only (all invoices are email-only)
+  emailOnly       Boolean   @default(false) @map("email_only")
+
+  // Import metadata
+  importedAt      DateTime  @default(now()) @map("imported_at")
+
+  // Relationships
+  invoices        Invoice[]
+  calls           Call[]
+
+  @@unique([campaignId, debtorNumber])
+  @@unique([campaignId, debtorName, debtorMc])
+  @@index([campaignId])
+  @@index([phoneNumber])
+  @@index([debtorName])
+  @@index([emailOnly])
+  @@map("debtors")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INVOICE MODEL - Individual loads/invoices (many per debtor)
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Invoice {
+  id              String    @id @default(uuid())
+  debtorId        String    @map("debtor_id")
+  debtor          Debtor    @relation(fields: [debtorId], references: [id], onDelete: Cascade)
+
+  // Invoice/Load Info
+  loadNumber      String    @map("load_number")
+  carrierName     String?   @map("carrier_name")
+  clientMc        String?   @map("client_mc")
+  clientDot       String?   @map("client_dot")
+  amount          Float
+  emailOnly       Boolean   @default(false) @map("email_only")
+
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@index([debtorId])
+  @@map("invoices")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALL MODEL - Call attempts to debtors
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Call {
+  id              String    @id @default(uuid())
+  debtorId        String    @map("debtor_id")
+  debtor          Debtor    @relation(fields: [debtorId], references: [id])
+
+  // Campaign relationship (denormalized for efficient queries)
+  campaignId      String    @map("campaign_id")
+  campaign        Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  attemptNumber   Int       @map("attempt_number")
+
+  // HappyRobot tracking
+  runId           String?   @unique @map("run_id")
+  status          String    @default("PENDING")
+  // PENDING, QUEUED, RUNNING, COMPLETED, FAILED, CANCELED
+
+  // ═══════════════════════════════════════════════════════════════════
+  // CALL OUTCOMES (classifications from HappyRobot)
+  // ═══════════════════════════════════════════════════════════════════
+
+  // Primary outcome
+  callOutcome     String    @default("PENDING") @map("call_outcome")
+  // PENDING, PAYMENT_PROMISED, DECLINED, DISPUTED,
+  // NO_ANSWER, VOICEMAIL, WRONG_NUMBER, CALLBACK_REQUESTED, etc.
+
+  // Additional outcome details
+  promisedDate    String?   @map("promised_date")
+  promisedAmount  Float?    @map("promised_amount")
+  declineReason   String?   @map("decline_reason")
+  disputeReason   String?   @map("dispute_reason")
+  callSummary     String?   @map("call_summary")
+  callTags        String[]  @default([]) @map("call_tags")
+  followUpNeeded  Boolean   @default(false) @map("follow_up_needed")
+
+  // ═══════════════════════════════════════════════════════════════════
+  // CALL METADATA
+  // ═══════════════════════════════════════════════════════════════════
+
+  callDuration    Int?      @map("call_duration") // seconds
+  metadata        String?   // JSON string of raw HappyRobot response
+  errorMessage    String?   @map("error_message")
+
+  // Timestamps
+  triggeredAt     DateTime? @map("triggered_at")
+  completedAt     DateTime? @map("completed_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@index([campaignId])
+  @@index([status])
+  @@index([callOutcome])
+  @@index([debtorId])
+  @@index([createdAt])
+  @@map("calls")
+}
