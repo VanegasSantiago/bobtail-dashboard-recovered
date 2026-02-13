@@ -4,7 +4,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
 import { cn } from "@/lib/utils";
 
-const MAX_CONCURRENT = parseInt(process.env.NEXT_PUBLIC_MAX_CONCURRENT_CALLS ?? "25", 10);
+interface ActiveCallStats {
+  running?: number;
+  queued?: number;
+  maxConcurrent?: number;
+  isPaused?: boolean;
+}
 
 export function ActiveCallsBar() {
   const queryClient = useQueryClient();
@@ -13,7 +18,7 @@ export function ActiveCallsBar() {
   // Check if user can perform operations (ADMIN or OPERATOR)
   const canOperate = session?.user?.role === "ADMIN" || session?.user?.role === "OPERATOR";
 
-  const { data: stats } = useQuery({
+  const { data: stats } = useQuery<ActiveCallStats>({
     queryKey: ["active-calls-stats"],
     queryFn: async () => {
       const res = await fetch("/api/calls/active/stats");
@@ -22,7 +27,7 @@ export function ActiveCallsBar() {
     },
     // Only poll when there are active/queued calls - no polling when idle
     refetchInterval: (query) => {
-      const data = query.state.data as { running?: number; queued?: number } | undefined;
+      const data = query.state.data as ActiveCallStats | undefined;
       const hasActivity = (data?.running ?? 0) > 0 || (data?.queued ?? 0) > 0;
       return hasActivity ? 3000 : false; // 3s when active, no polling when idle
     },
@@ -54,13 +59,14 @@ export function ActiveCallsBar() {
 
   const running = stats?.running ?? 0;
   const queued = stats?.queued ?? 0;
+  const maxConcurrent = Math.max(1, stats?.maxConcurrent ?? 25);
   const isPaused = stats?.isPaused ?? false;
-  const percentage = (running / MAX_CONCURRENT) * 100;
+  const percentage = (running / maxConcurrent) * 100;
   const isActionPending = pauseMutation.isPending || resumeMutation.isPending;
 
   const getStatusColor = () => {
-    if (running >= MAX_CONCURRENT) return "#ef4444";
-    if (running >= 40) return "#f59e0b";
+    if (running >= maxConcurrent) return "#ef4444";
+    if (running >= Math.floor(maxConcurrent * 0.8)) return "#f59e0b";
     return "#10b981";
   };
 
@@ -114,7 +120,7 @@ export function ActiveCallsBar() {
               className="text-[13px]"
               style={{ color: "var(--fg-muted)" }}
             >
-              / {MAX_CONCURRENT}
+              / {maxConcurrent}
             </span>
           </div>
 

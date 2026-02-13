@@ -17,7 +17,12 @@ interface ActiveCall {
   triggeredAt: string | null;
 }
 
-const MAX_SLOTS = parseInt(process.env.NEXT_PUBLIC_MAX_CONCURRENT_CALLS ?? "25", 10);
+interface ActiveCallStats {
+  maxConcurrent?: number;
+  running?: number;
+  queued?: number;
+}
+
 const HAPPYROBOT_ORG = process.env.NEXT_PUBLIC_HAPPYROBOT_ORG_SLUG;
 const HAPPYROBOT_WORKFLOW = process.env.NEXT_PUBLIC_HAPPYROBOT_WORKFLOW_ID;
 
@@ -141,12 +146,12 @@ function CallSlot({ call, index }: { call?: ActiveCall; index: number }) {
   );
 }
 
-function StatsHeader({ activeCount }: { activeCount: number }) {
-  const percentage = (activeCount / MAX_SLOTS) * 100;
+function StatsHeader({ activeCount, maxSlots }: { activeCount: number; maxSlots: number }) {
+  const percentage = (activeCount / maxSlots) * 100;
 
   const getStatusColor = () => {
-    if (activeCount >= MAX_SLOTS) return "var(--color-danger)";
-    if (activeCount >= 20) return "var(--color-warning)";
+    if (activeCount >= maxSlots) return "var(--color-danger)";
+    if (activeCount >= Math.floor(maxSlots * 0.8)) return "var(--color-warning)";
     return "var(--color-success)";
   };
 
@@ -164,7 +169,7 @@ function StatsHeader({ activeCount }: { activeCount: number }) {
             {activeCount}
           </span>
           <span className="text-[13px]" style={{ color: "var(--fg-muted)" }}>
-            / {MAX_SLOTS}
+            / {maxSlots}
           </span>
           <div
             className="ml-2 h-2 w-32 overflow-hidden rounded-full"
@@ -212,12 +217,22 @@ export default function ActiveCallsPage() {
     },
   });
 
+  const { data: stats } = useQuery<ActiveCallStats>({
+    queryKey: ["active-calls-stats"],
+    queryFn: async () => {
+      const res = await fetch("/api/calls/active/stats");
+      if (!res.ok) throw new Error("Failed to fetch active stats");
+      return res.json();
+    },
+  });
+
+  const maxSlots = Math.max(1, stats?.maxConcurrent ?? 25);
   const activeCount = calls?.length ?? 0;
-  const slots = Array.from({ length: MAX_SLOTS }, (_, i) => calls?.[i]);
+  const slots = Array.from({ length: maxSlots }, (_, i) => calls?.[i]);
 
   return (
     <div className="space-y-4">
-      <StatsHeader activeCount={activeCount} />
+      <StatsHeader activeCount={activeCount} maxSlots={maxSlots} />
 
       {isLoading ? (
         <div className="flex h-64 items-center justify-center">

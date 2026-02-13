@@ -9,6 +9,8 @@ export async function GET() {
   }
 
   try {
+    const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_CALLS ?? "25", 10);
+
     // Get the active campaign
     const campaign = await prisma.campaign.findFirst({
       where: { isActive: true },
@@ -18,6 +20,7 @@ export async function GET() {
       return NextResponse.json({
         running: 0,
         queued: 0,
+        maxConcurrent,
         isPaused: false,
         campaignId: null,
         campaignName: null,
@@ -39,6 +42,7 @@ export async function GET() {
     return NextResponse.json({
       running,
       queued,
+      maxConcurrent,
       isPaused: campaign.isQueuePaused,
       campaignId: campaign.id,
       campaignName: campaign.name,
