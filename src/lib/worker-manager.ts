@@ -25,10 +25,11 @@ import { prisma } from "@/lib/prisma";
 // Configuration
 const POLL_INTERVAL = 10_000; // 10 seconds between cycles
 const PAUSED_CHECK_INTERVAL = 30_000; // 30 seconds when paused
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CALLS ?? "25", 10);
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CALLS ?? "50", 10);
 const MAX_CONSECUTIVE_ERRORS = 5; // Stop after this many consecutive errors
 const ERROR_BACKOFF_BASE = 5_000; // Base backoff time in ms
 const RUNNING_CALL_TIMEOUT_MS = 40 * 60 * 1000; // 40 minutes
+const ZOMBIE_CLEANUP_EVERY_CYCLES = 20;
 
 // HappyRobot config (with fallbacks to prevent crashes)
 const HAPPYROBOT_WEBHOOK_URL = process.env.HAPPYROBOT_ENDPOINT ?? "";
@@ -97,13 +98,13 @@ async function cleanupZombieRunningCalls(): Promise<number> {
     where: { id: { in: staleCallIds } },
     data: {
       status: "FAILED",
-      callOutcome: "COMPLETED_UNKNOWN",
+      callOutcome: "SYSTEM_TIMEOUT",
       completedAt: now,
-      errorMessage: "Marked failed by worker startup cleanup after exceeding 1 hour in RUNNING status",
+      errorMessage: "Marked failed by worker cleanup after exceeding 40 minutes in RUNNING status",
     },
   });
 
-  console.warn(
+  console.error(
     `[Worker] Zombie cleanup: marked ${staleCallIds.length} stale RUNNING call(s) as FAILED`
   );
 
@@ -164,6 +165,10 @@ async function pollRunStatus(runId: string): Promise<Record<string, unknown> | n
       }
     );
 
+    if (response.status === 404) {
+      return { status: "not_found" };
+    }
+
     if (!response.ok) {
       return null;
     }
@@ -179,7 +184,9 @@ function classifyOutcome(value: string): string | null {
   const v = value.toLowerCase().trim();
   if (!v) return null;
 
-  if (v.includes("promise") || v.includes("will_pay") || v.includes("will pay") || v.includes("payment_promised")) {
+  if (v.includes("canceled") || v.includes("cancelled")) {
+    return "SYSTEM_CANCELED";
+  } else if (v.includes("promise") || v.includes("will_pay") || v.includes("will pay") || v.includes("payment_promised")) {
     return "PAYMENT_PROMISED";
   } else if (v.includes("decline") || v.includes("refuse") || v.includes("rejected")) {
     return "DECLINED";
@@ -280,7 +287,7 @@ function deepSearchForOutcome(obj: unknown, depth = 0): {
 
 // Extract call outcome from HappyRobot response
 // Searches the entire response recursively for classification data
-function extractOutcome(fullResponse: Record<string, unknown>): {
+function extractOutcome(fullResponse: Record<string, unknown>, runStatus: string): {
   callOutcome: string;
   callDuration: number | null;
   callSummary: string | null;
@@ -299,8 +306,17 @@ function extractOutcome(fullResponse: Record<string, unknown>): {
     }
   }
 
+  let callOutcome = result.callOutcome ?? "COMPLETED_UNKNOWN";
+  if (
+    result.callDuration === 0 &&
+    (runStatus === "completed" || runStatus === "canceled") &&
+    !result.callOutcome
+  ) {
+    callOutcome = "CONNECT_FAILED";
+  }
+
   return {
-    callOutcome: result.callOutcome ?? "COMPLETED_UNKNOWN",
+    callOutcome,
     callDuration: result.callDuration,
     callSummary: result.callSummary,
   };
@@ -347,9 +363,12 @@ async function processQueueCycle(campaignId: string, isPaused: boolean = false):
   if (!isPaused) {
     const slotsAvailable = MAX_CONCURRENT - runningCount;
     if (slotsAvailable > 0) {
+      const takeCount = consecutiveErrors > 2
+        ? Math.min(slotsAvailable, 5)
+        : slotsAvailable;
       const pendingCalls = await prisma.call.findMany({
         where: { campaignId, status: "PENDING" },
-        take: slotsAvailable,
+        take: takeCount,
         include: {
           debtor: {
             include: { invoices: true },
@@ -441,6 +460,24 @@ async function processQueueCycle(campaignId: string, isPaused: boolean = false):
 
     if (!status) continue;
 
+    const runStatus = String(status.status ?? "running").toLowerCase();
+
+    if (runStatus === "not_found") {
+      await prisma.call.update({
+        where: { id: call.id },
+        data: {
+          status: "FAILED",
+          callOutcome: "CALL_LOST_BY_PROVIDER",
+          completedAt: new Date(),
+          errorMessage: `Run not found at provider (404) for runId=${call.runId}`,
+        },
+      });
+      completed++;
+      stats.totalFailed++;
+      console.warn(`[Worker] Call ${call.id} failed: provider run not found (runId=${call.runId})`);
+      continue;
+    }
+
     const statusMap: Record<string, string> = {
       pending: "RUNNING",
       running: "RUNNING",
@@ -449,11 +486,10 @@ async function processQueueCycle(campaignId: string, isPaused: boolean = false):
       canceled: "CANCELED",
     };
 
-    const runStatus = String(status.status ?? "running");
     const newStatus = statusMap[runStatus] ?? "RUNNING";
 
     if (newStatus !== "RUNNING") {
-      const { callOutcome, callDuration, callSummary } = extractOutcome(status);
+      const { callOutcome, callDuration, callSummary } = extractOutcome(status, runStatus);
 
       // Save full response for debugging - truncate if too large
       let metadata: string | null = null;
@@ -564,6 +600,7 @@ async function runWorkerLoop(): Promise<void> {
   consecutiveErrors = 0;
 
   console.log(`[Worker] Active campaign: ${campaign.name} (${campaign.id})`);
+  let cycleCount = 0;
 
   let initialStatus;
   try {
@@ -606,8 +643,20 @@ async function runWorkerLoop(): Promise<void> {
 
   while (!shouldStop) {
     const startTime = Date.now();
+    cycleCount++;
 
     try {
+      if (cycleCount % ZOMBIE_CLEANUP_EVERY_CYCLES === 0) {
+        try {
+          const cleaned = await cleanupZombieRunningCalls();
+          if (cleaned > 0) {
+            console.log(`[Worker] Periodic cleanup complete: ${cleaned} stale RUNNING call(s) resolved`);
+          }
+        } catch (cleanupError) {
+          console.error("[Worker] Periodic zombie cleanup failed:", cleanupError);
+        }
+      }
+
       // Re-check active campaign (might have changed)
       const currentCampaign = await getActiveCampaign();
       if (!currentCampaign || currentCampaign.id !== campaign.id) {
