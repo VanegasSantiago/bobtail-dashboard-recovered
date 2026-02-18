@@ -28,6 +28,7 @@ const PAUSED_CHECK_INTERVAL = 30_000; // 30 seconds when paused
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CALLS ?? "25", 10);
 const MAX_CONSECUTIVE_ERRORS = 5; // Stop after this many consecutive errors
 const ERROR_BACKOFF_BASE = 5_000; // Base backoff time in ms
+const RUNNING_CALL_TIMEOUT_MS = 40 * 60 * 1000; // 40 minutes
 
 // HappyRobot config (with fallbacks to prevent crashes)
 const HAPPYROBOT_WEBHOOK_URL = process.env.HAPPYROBOT_ENDPOINT ?? "";
@@ -41,7 +42,7 @@ let currentPromise: Promise<void> | null = null;
 let consecutiveErrors = 0;
 
 // Stats for monitoring
-let stats = {
+const stats = {
   startedAt: null as Date | null,
   campaignId: null as string | null,
   campaignName: null as string | null,
@@ -69,6 +70,44 @@ async function getActiveCampaign() {
   return prisma.campaign.findFirst({
     where: { isActive: true },
   });
+}
+
+// Mark stale RUNNING calls as failed when they have exceeded the timeout
+async function cleanupZombieRunningCalls(): Promise<number> {
+  const cutoff = new Date(Date.now() - RUNNING_CALL_TIMEOUT_MS);
+  const staleCalls = await prisma.call.findMany({
+    where: {
+      status: "RUNNING",
+      OR: [
+        { triggeredAt: { lte: cutoff } },
+        { triggeredAt: null, updatedAt: { lte: cutoff } },
+      ],
+    },
+    select: { id: true },
+  });
+
+  if (staleCalls.length === 0) {
+    return 0;
+  }
+
+  const staleCallIds = staleCalls.map((call) => call.id);
+  const now = new Date();
+
+  await prisma.call.updateMany({
+    where: { id: { in: staleCallIds } },
+    data: {
+      status: "FAILED",
+      callOutcome: "COMPLETED_UNKNOWN",
+      completedAt: now,
+      errorMessage: "Marked failed by worker startup cleanup after exceeding 1 hour in RUNNING status",
+    },
+  });
+
+  console.warn(
+    `[Worker] Zombie cleanup: marked ${staleCallIds.length} stale RUNNING call(s) as FAILED`
+  );
+
+  return staleCallIds.length;
 }
 
 // Trigger a call via HappyRobot webhook
@@ -477,6 +516,16 @@ async function runWorkerLoop(): Promise<void> {
   console.log("[Worker] ========================================");
   console.log(`[Worker] Max concurrent calls: ${MAX_CONCURRENT}`);
   console.log(`[Worker] Poll interval: ${POLL_INTERVAL}ms`);
+
+  try {
+    const cleaned = await cleanupZombieRunningCalls();
+    if (cleaned > 0) {
+      console.log(`[Worker] Startup cleanup complete: ${cleaned} stale RUNNING call(s) resolved`);
+    }
+  } catch (error) {
+    console.error("[Worker] Zombie cleanup failed:", error);
+    // Non-fatal: continue worker startup even if cleanup fails
+  }
 
   // Validate configuration
   const configCheck = validateConfig();
